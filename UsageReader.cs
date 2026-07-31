@@ -65,6 +65,7 @@ public sealed class UsageReader
             {
                 var candidate = ReadLatestFromFile(file.FullName);
                 if (candidate is not null &&
+                    string.Equals(candidate.LimitId, "codex", StringComparison.Ordinal) &&
                     (_cachedSnapshot is null || candidate.SourceTimestamp > _cachedSnapshot.SourceTimestamp))
                 {
                     _cachedSnapshot = candidate;

@@ -7,6 +7,7 @@ try
 {
     var olderPath = Path.Combine(temporaryRoot, "2026", "07", "31", "older.jsonl");
     var newerPath = Path.Combine(temporaryRoot, "2026", "07", "31", "newer.jsonl");
+    var alternateLimitPath = Path.Combine(temporaryRoot, "2026", "07", "31", "alternate.jsonl");
 
     File.WriteAllLines(
         olderPath,
@@ -21,6 +22,12 @@ try
             """{"timestamp":"2026-07-31T02:00:00Z","type":"response_item","payload":{"type":"message","text":"rate_limits token_count"}}""",
             """{"timestamp":"2026-07-31T03:00:00Z","type":"event_msg","payload":{"type":"token_count","rate_limits":{"limit_id":"codex","primary":{"used_percent":55,"window_minutes":300,"resets_at":1785470400},"secondary":{"used_percent":77,"window_minutes":10080,"resets_at":1785902975},"plan_type":"pro"}}}"""
         });
+    File.WriteAllLines(
+        alternateLimitPath,
+        new[]
+        {
+            """{"timestamp":"2026-07-31T03:30:00Z","type":"event_msg","payload":{"type":"token_count","rate_limits":{"limit_id":"codex_bengalfox","primary":{"used_percent":0,"window_minutes":10080,"resets_at":1785936699},"secondary":null,"plan_type":"pro"}}}"""
+        });
 
     File.SetLastWriteTimeUtc(olderPath, DateTime.UtcNow.AddMinutes(-1));
     File.SetLastWriteTimeUtc(newerPath, DateTime.UtcNow);
@@ -32,6 +39,7 @@ try
     Assert(snapshot.Limits.Count == 2, "Both limit windows should be parsed.");
     Assert(snapshot.SelectedLimit.UsedPercent == 77, "The most constrained window should be selected.");
     Assert(snapshot.SelectedLimit.WindowMinutes == 10080, "Selected window metadata is incorrect.");
+    Assert(snapshot.LimitId == "codex", "Non-codex limit IDs should be ignored.");
 
     File.AppendAllLines(
         newerPath,

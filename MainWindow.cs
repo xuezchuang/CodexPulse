@@ -401,18 +401,14 @@ public sealed class MainWindow : Window
             var snapshot = await Task.Run(_reader.ReadLatest);
             if (snapshot is null)
             {
-                ShowNoData();
                 return;
             }
 
             ShowSnapshot(snapshot);
         }
-        catch (Exception exception)
+        catch (Exception)
         {
-            _percentText.Text = "!";
-            _detailText.Text = "读取失败，右键重试";
-            ToolTip = $"Codex 用量读取失败：{exception.Message}";
-            SnapshotChanged?.Invoke(null, "Codex 用量读取失败");
+            // Keep the last successfully rendered usage snapshot.
         }
         finally
         {
@@ -505,17 +501,6 @@ public sealed class MainWindow : Window
         SnapshotChanged?.Invoke(
             remaining,
             $"Codex 剩余 {Math.Round(remaining, MidpointRounding.AwayFromZero):0}%");
-    }
-
-    private void ShowNoData()
-    {
-        _remainingFraction = 0;
-        _percentText.Text = "--";
-        _detailText.Text = "使用一次 Codex 后自动更新";
-        _progressArc.Stroke = new SolidColorBrush(Color.FromRgb(83, 92, 104));
-        UpdateProgressArc();
-        ToolTip = "尚未在本机 Codex 会话中找到用量数据";
-        SnapshotChanged?.Invoke(null, "Codex 用量：暂无数据");
     }
 
     private static string FormatWindow(int? windowMinutes)
