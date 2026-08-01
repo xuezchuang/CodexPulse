@@ -24,7 +24,6 @@ public sealed record UsageSnapshot(
 public sealed class UsageReader
 {
     private const int InitialFileLimit = 100;
-    private const int RefreshFileLimit = 30;
     private const int TailByteLimit = 6 * 1024 * 1024;
 
     private readonly object _sync = new();
@@ -55,10 +54,16 @@ public sealed class UsageReader
             }
 
             var scanStartedUtc = DateTime.UtcNow;
-            var files = EnumerateCandidateFiles()
+            var candidateFiles = EnumerateCandidateFiles()
                 .Where(file => !_initialized || file.LastWriteTimeUtc >= _lastScanUtc.AddSeconds(-5))
-                .OrderByDescending(file => file.LastWriteTimeUtc)
-                .Take(_initialized ? RefreshFileLimit : InitialFileLimit)
+                .OrderByDescending(file => file.LastWriteTimeUtc);
+
+            // During refresh, every file changed since the previous scan matters. A fixed
+            // cap can exclude the session containing the newest rate-limit event when many
+            // Codex sessions write at once. The timestamp filter keeps this incremental.
+            var files = (_initialized
+                    ? candidateFiles
+                    : candidateFiles.Take(InitialFileLimit))
                 .ToArray();
 
             foreach (var file in files)

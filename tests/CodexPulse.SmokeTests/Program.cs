@@ -53,6 +53,34 @@ try
     Assert(snapshot.SourceTimestamp == DateTimeOffset.Parse("2026-07-31T04:00:00Z"), "Changed file was not refreshed.");
     Assert(snapshot.SelectedLimit.UsedPercent == 80, "Refreshed percentage is incorrect.");
 
+    var concurrentWriteTime = DateTime.UtcNow.AddSeconds(3);
+    for (var index = 0; index < 35; index++)
+    {
+        var concurrentPath = Path.Combine(temporaryRoot, "2026", "07", "31", $"concurrent-{index:00}.jsonl");
+        File.WriteAllLines(
+            concurrentPath,
+            new[]
+            {
+                """{"timestamp":"2026-07-31T04:30:00Z","type":"event_msg","payload":{"type":"token_count","rate_limits":{"limit_id":"codex","primary":{"used_percent":81,"window_minutes":10080,"resets_at":1785902975},"secondary":null,"plan_type":"pro"}}}"""
+            });
+        File.SetLastWriteTimeUtc(concurrentPath, concurrentWriteTime);
+    }
+
+    var latestLimitPath = Path.Combine(temporaryRoot, "2026", "07", "31", "latest-limit.jsonl");
+    File.WriteAllLines(
+        latestLimitPath,
+        new[]
+        {
+            """{"timestamp":"2026-07-31T05:00:00Z","type":"event_msg","payload":{"type":"token_count","rate_limits":{"limit_id":"codex","primary":{"used_percent":82,"window_minutes":10080,"resets_at":1785902975},"secondary":null,"plan_type":"pro"}}}"""
+        });
+    File.SetLastWriteTimeUtc(latestLimitPath, concurrentWriteTime.AddSeconds(-1));
+
+    snapshot = reader.ReadLatest() ?? throw new InvalidOperationException("Expected a concurrent refresh snapshot.");
+    Assert(
+        snapshot.SourceTimestamp == DateTimeOffset.Parse("2026-07-31T05:00:00Z"),
+        "Refresh must inspect every changed session file, even when more than 30 files changed.");
+    Assert(snapshot.SelectedLimit.UsedPercent == 82, "Latest concurrent limit percentage is incorrect.");
+
     using var systemReader = new SystemMonitorReader();
     _ = systemReader.Sample();
     Thread.Sleep(1100);
