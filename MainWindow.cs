@@ -27,6 +27,7 @@ public sealed class MainWindow : Window
     private readonly TextBlock _uploadText;
     private readonly TextBlock _downloadText;
     private readonly TextBlock _cpuText;
+    private readonly TextBlock _cpuTemperatureText;
     private readonly TextBlock _memoryText;
     private readonly Border _memoryTile;
     private readonly MenuItem _startupMenuItem;
@@ -145,12 +146,16 @@ public sealed class MainWindow : Window
         contentLayout.RowDefinitions.Add(new RowDefinition { Height = new GridLength(1, GridUnitType.Star) });
         Grid.SetColumn(contentLayout, 1);
 
-        var labels = new StackPanel
+        var labels = new Grid
         {
             VerticalAlignment = VerticalAlignment.Top,
             Margin = new Thickness(0, 8, 0, 0)
         };
-        labels.Children.Add(new TextBlock
+        labels.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+        labels.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+
+        var titleLayout = new StackPanel();
+        titleLayout.Children.Add(new TextBlock
         {
             Text = "Codex Left",
             Foreground = new SolidColorBrush(Color.FromRgb(239, 242, 245)),
@@ -167,7 +172,47 @@ public sealed class MainWindow : Window
             Margin = new Thickness(0, 1, 0, 0),
             TextTrimming = TextTrimming.CharacterEllipsis
         };
-        labels.Children.Add(_detailText);
+        titleLayout.Children.Add(_detailText);
+        labels.Children.Add(titleLayout);
+
+        var temperatureContents = new StackPanel
+        {
+            Orientation = Orientation.Horizontal,
+            VerticalAlignment = VerticalAlignment.Center,
+            Margin = new Thickness(10, 1, 0, 0)
+        };
+        temperatureContents.Children.Add(new TextBlock
+        {
+            Text = "CPU",
+            Foreground = new SolidColorBrush(Color.FromRgb(255, 190, 190)),
+            FontFamily = new FontFamily("Segoe UI Variable Text, Segoe UI"),
+            FontSize = 12.5,
+            FontWeight = FontWeights.SemiBold,
+            VerticalAlignment = VerticalAlignment.Center
+        });
+        _cpuTemperatureText = new TextBlock
+        {
+            Text = "--°C",
+            Foreground = new SolidColorBrush(Color.FromRgb(255, 235, 235)),
+            FontFamily = new FontFamily("Segoe UI Variable Text, Segoe UI"),
+            FontSize = 16,
+            FontWeight = FontWeights.SemiBold,
+            Margin = new Thickness(6, 0, 0, 0),
+            VerticalAlignment = VerticalAlignment.Center
+        };
+        temperatureContents.Children.Add(_cpuTemperatureText);
+        var temperatureBadge = new Border
+        {
+            Background = new SolidColorBrush(Color.FromRgb(78, 26, 30)),
+            BorderBrush = new SolidColorBrush(Color.FromRgb(129, 47, 52)),
+            BorderThickness = new Thickness(1),
+            CornerRadius = new CornerRadius(6),
+            Padding = new Thickness(9, 5, 9, 5),
+            ToolTip = "CPU Package 温度（Armoury Crate）",
+            Child = temperatureContents
+        };
+        Grid.SetColumn(temperatureBadge, 1);
+        labels.Children.Add(temperatureBadge);
         contentLayout.Children.Add(labels);
 
         var systemLayout = new Grid
@@ -424,6 +469,9 @@ public sealed class MainWindow : Window
             _uploadText.Text = FormatRate(snapshot.UploadBytesPerSecond);
             _downloadText.Text = FormatRate(snapshot.DownloadBytesPerSecond);
             _cpuText.Text = $"{snapshot.CpuPercent:0}%";
+            _cpuTemperatureText.Text = snapshot.CpuTemperatureCelsius is { } temperature
+                ? $"{temperature:0}°C"
+                : "--°C";
             _memoryText.Text = $"{snapshot.MemoryPercent:0}%";
             _memoryTile.Background = new SolidColorBrush(snapshot.MemoryPercent switch
             {
@@ -437,6 +485,7 @@ public sealed class MainWindow : Window
             _uploadText.Text = "--";
             _downloadText.Text = "--";
             _cpuText.Text = "--";
+            _cpuTemperatureText.Text = "--°C";
             _memoryText.Text = "--";
         }
     }
@@ -664,6 +713,7 @@ public sealed class MainWindow : Window
         _allowClose = true;
         _usageRefreshTimer.Stop();
         _systemRefreshTimer.Stop();
+        _systemMonitorReader.Dispose();
         Close();
     }
 

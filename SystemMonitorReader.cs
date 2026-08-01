@@ -1,6 +1,6 @@
 using System;
-using System.Collections.Generic;
 using System.Diagnostics;
+using System.IO;
 using System.Linq;
 using System.Net.NetworkInformation;
 using System.Runtime.InteropServices;
@@ -11,10 +11,19 @@ public sealed record SystemSnapshot(
     double UploadBytesPerSecond,
     double DownloadBytesPerSecond,
     double CpuPercent,
-    double MemoryPercent);
+    double MemoryPercent,
+    double? CpuTemperatureCelsius);
 
-public sealed class SystemMonitorReader
+public sealed class SystemMonitorReader : IDisposable
 {
+    private const int AsusTemperatureDataType = 3;
+    private const int AsusRecordSize = 0x88;
+    private const int AsusSensorNameOffset = 0x24;
+    private const int AsusBufferSize = 64 * 1024;
+
+    private readonly IntPtr _asusHardwareMonitorLibrary;
+    private readonly IntPtr _asusHardwareMonitorBuffer;
+    private readonly AsusHardwareMonitorGetData? _getAsusHardwareMonitorData;
     private long? _previousNetworkTimestamp;
     private ulong _previousBytesSent;
     private ulong _previousBytesReceived;
@@ -22,6 +31,33 @@ public sealed class SystemMonitorReader
     private ulong _previousIdleTime;
     private ulong _previousKernelTime;
     private ulong _previousUserTime;
+    private bool _disposed;
+
+    public SystemMonitorReader()
+    {
+        var libraryPath = Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles),
+            "ASUS",
+            "Aac_AIOFan",
+            "aaHMLib_x64.dll");
+        if (!NativeLibrary.TryLoad(libraryPath, out var library))
+        {
+            return;
+        }
+
+        try
+        {
+            var export = NativeLibrary.GetExport(library, "HM_GetData2");
+            _getAsusHardwareMonitorData =
+                Marshal.GetDelegateForFunctionPointer<AsusHardwareMonitorGetData>(export);
+            _asusHardwareMonitorBuffer = Marshal.AllocHGlobal(AsusBufferSize);
+            _asusHardwareMonitorLibrary = library;
+        }
+        catch
+        {
+            NativeLibrary.Free(library);
+        }
+    }
 
     public SystemSnapshot Sample()
     {
@@ -52,8 +88,72 @@ public sealed class SystemMonitorReader
             uploadBytesPerSecond,
             downloadBytesPerSecond,
             ReadCpuPercent(),
-            ReadMemoryPercent());
+            ReadMemoryPercent(),
+            ReadCpuTemperatureCelsius());
     }
+
+    public void Dispose()
+    {
+        if (_disposed)
+        {
+            return;
+        }
+
+        _disposed = true;
+        if (_asusHardwareMonitorBuffer != IntPtr.Zero)
+        {
+            Marshal.FreeHGlobal(_asusHardwareMonitorBuffer);
+        }
+        if (_asusHardwareMonitorLibrary != IntPtr.Zero)
+        {
+            NativeLibrary.Free(_asusHardwareMonitorLibrary);
+        }
+    }
+
+    private double? ReadCpuTemperatureCelsius()
+    {
+        try
+        {
+            if (_getAsusHardwareMonitorData is null ||
+                _asusHardwareMonitorBuffer == IntPtr.Zero)
+            {
+                return null;
+            }
+
+            var count = _getAsusHardwareMonitorData(
+                AsusTemperatureDataType,
+                _asusHardwareMonitorBuffer);
+            if (count <= 0 || count > AsusBufferSize / AsusRecordSize)
+            {
+                return null;
+            }
+
+            for (var index = 0; index < count; index++)
+            {
+                var record = IntPtr.Add(
+                    _asusHardwareMonitorBuffer,
+                    index * AsusRecordSize);
+                var sensorName = Marshal.PtrToStringUni(
+                    IntPtr.Add(record, AsusSensorNameOffset));
+                if (!string.Equals(sensorName, "CPU Package", StringComparison.Ordinal))
+                {
+                    continue;
+                }
+
+                var temperature = Marshal.ReadInt32(record, sizeof(int)) / 10d;
+                return temperature is >= 0 and <= 125 ? temperature : null;
+            }
+        }
+        catch
+        {
+            // Armoury Crate may be updating or restarting its hardware-monitor service.
+        }
+
+        return null;
+    }
+
+    [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+    private delegate int AsusHardwareMonitorGetData(int type, IntPtr buffer);
 
     private static double CalculateRate(ulong current, ulong previous, double elapsedSeconds)
     {

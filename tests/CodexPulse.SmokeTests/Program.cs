@@ -53,7 +53,7 @@ try
     Assert(snapshot.SourceTimestamp == DateTimeOffset.Parse("2026-07-31T04:00:00Z"), "Changed file was not refreshed.");
     Assert(snapshot.SelectedLimit.UsedPercent == 80, "Refreshed percentage is incorrect.");
 
-    var systemReader = new SystemMonitorReader();
+    using var systemReader = new SystemMonitorReader();
     _ = systemReader.Sample();
     Thread.Sleep(1100);
     var systemSnapshot = systemReader.Sample();
@@ -65,8 +65,14 @@ try
     Assert(
         systemSnapshot.MemoryPercent is > 0 and <= 100,
         "Memory percentage must stay in the 0-100 range.");
+    Assert(
+        systemSnapshot.CpuTemperatureCelsius is null or (>= 0 and <= 125),
+        "CPU temperature must be absent or remain in a plausible range.");
 
-    Console.WriteLine("PASS: Codex limits, refresh caching, network, CPU, and memory sampling.");
+    var temperatureText = systemSnapshot.CpuTemperatureCelsius is { } temperature
+        ? $"{temperature:0.0}°C"
+        : "unavailable";
+    Console.WriteLine($"PASS: Codex limits, refresh caching, network, CPU, memory, and temperature sampling ({temperatureText}).");
     return 0;
 }
 finally
