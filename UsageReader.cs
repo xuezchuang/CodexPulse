@@ -1,269 +1,185 @@
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.IO;
 using System.Linq;
-using System.Text;
 using System.Text.Json;
+using System.Threading;
+using System.Threading.Tasks;
 
 namespace CodexPulse;
 
-public sealed record LimitSnapshot(
-    string Name,
-    double UsedPercent,
-    int? WindowMinutes,
-    DateTimeOffset? ResetsAt);
-
 public sealed record UsageSnapshot(
     DateTimeOffset SourceTimestamp,
-    string SourceFile,
     string? PlanType,
-    string? LimitId,
-    IReadOnlyList<LimitSnapshot> Limits,
-    LimitSnapshot SelectedLimit);
+    string LimitId,
+    string LimitName,
+    double UsedPercent,
+    DateTimeOffset? ResetsAt);
 
 public sealed class UsageReader
 {
-    private const int InitialFileLimit = 100;
-    private const int TailByteLimit = 6 * 1024 * 1024;
-
-    private readonly object _sync = new();
-    private bool _initialized;
-    private DateTime _lastScanUtc = DateTime.MinValue;
-    private UsageSnapshot? _cachedSnapshot;
-
-    public UsageReader(string? sessionRoot = null)
-    {
-        SessionRoot = sessionRoot ??
-            Path.Combine(
-                Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
-                ".codex",
-                "sessions");
-    }
-
-    public string SessionRoot { get; }
+    private static readonly TimeSpan RequestTimeout = TimeSpan.FromSeconds(20);
 
     public UsageSnapshot? ReadLatest()
     {
-        lock (_sync)
-        {
-            if (!Directory.Exists(SessionRoot))
-            {
-                _initialized = true;
-                _lastScanUtc = DateTime.UtcNow;
-                return _cachedSnapshot;
-            }
-
-            var scanStartedUtc = DateTime.UtcNow;
-            var candidateFiles = EnumerateCandidateFiles()
-                .Where(file => !_initialized || file.LastWriteTimeUtc >= _lastScanUtc.AddSeconds(-5))
-                .OrderByDescending(file => file.LastWriteTimeUtc);
-
-            // During refresh, every file changed since the previous scan matters. A fixed
-            // cap can exclude the session containing the newest rate-limit event when many
-            // Codex sessions write at once. The timestamp filter keeps this incremental.
-            var files = (_initialized
-                    ? candidateFiles
-                    : candidateFiles.Take(InitialFileLimit))
-                .ToArray();
-
-            foreach (var file in files)
-            {
-                var candidate = ReadLatestFromFile(file.FullName);
-                if (candidate is not null &&
-                    string.Equals(candidate.LimitId, "codex", StringComparison.Ordinal) &&
-                    (_cachedSnapshot is null || candidate.SourceTimestamp > _cachedSnapshot.SourceTimestamp))
-                {
-                    _cachedSnapshot = candidate;
-                }
-            }
-
-            _initialized = true;
-            _lastScanUtc = scanStartedUtc;
-            return _cachedSnapshot;
-        }
+        return ReadLatestAsync().GetAwaiter().GetResult();
     }
 
-    private IEnumerable<FileInfo> EnumerateCandidateFiles()
+    private static async Task<UsageSnapshot?> ReadLatestAsync()
     {
-        var options = new EnumerationOptions
+        var codexPath = FindCodexExecutable();
+        if (codexPath is null)
         {
-            RecurseSubdirectories = true,
-            IgnoreInaccessible = true,
-            AttributesToSkip = FileAttributes.ReparsePoint,
-            ReturnSpecialDirectories = false
+            return null;
+        }
+
+        using var process = new Process
+        {
+            StartInfo = CreateStartInfo(codexPath),
+            EnableRaisingEvents = true
         };
 
-        IEnumerable<string> paths;
         try
         {
-            paths = Directory.EnumerateFiles(SessionRoot, "*.jsonl", options);
-        }
-        catch (IOException)
-        {
-            yield break;
-        }
-        catch (UnauthorizedAccessException)
-        {
-            yield break;
-        }
-
-        foreach (var path in paths)
-        {
-            FileInfo file;
-            try
+            if (!process.Start())
             {
-                file = new FileInfo(path);
-                _ = file.LastWriteTimeUtc;
-            }
-            catch (IOException)
-            {
-                continue;
-            }
-            catch (UnauthorizedAccessException)
-            {
-                continue;
+                return null;
             }
 
-            yield return file;
-        }
-    }
+            process.ErrorDataReceived += static (_, _) => { };
+            process.BeginErrorReadLine();
 
-    private static UsageSnapshot? ReadLatestFromFile(string path)
-    {
-        UsageSnapshot? latest = null;
-        try
-        {
-            using var stream = new FileStream(
-                path,
-                FileMode.Open,
-                FileAccess.Read,
-                FileShare.ReadWrite | FileShare.Delete);
-            var offset = Math.Max(0, stream.Length - TailByteLimit);
-            stream.Seek(offset, SeekOrigin.Begin);
+            await process.StandardInput.WriteLineAsync(
+                "{\"method\":\"initialize\",\"id\":1,\"params\":{\"clientInfo\":{\"name\":\"codex_pulse\",\"title\":\"CodexPulse\",\"version\":\"1.0.0\"}}}");
+            await process.StandardInput.FlushAsync();
 
-            using var reader = new StreamReader(
-                stream,
-                new UTF8Encoding(encoderShouldEmitUTF8Identifier: false, throwOnInvalidBytes: false),
-                detectEncodingFromByteOrderMarks: true);
-
-            if (offset > 0)
+            using var timeout = new CancellationTokenSource(RequestTimeout);
+            while (!timeout.IsCancellationRequested && !process.HasExited)
             {
-                _ = reader.ReadLine();
-            }
+                var line = await process.StandardOutput.ReadLineAsync(timeout.Token);
+                if (line is null)
+                {
+                    break;
+                }
 
-            while (reader.ReadLine() is { } line)
-            {
-                if (!line.Contains("\"rate_limits\"", StringComparison.Ordinal) ||
-                    !line.Contains("\"token_count\"", StringComparison.Ordinal))
+                if (!HasResponseId(line, 1))
                 {
                     continue;
                 }
 
-                var snapshot = TryParseSnapshot(line, path);
-                if (snapshot is not null &&
-                    (latest is null || snapshot.SourceTimestamp > latest.SourceTimestamp))
+                await process.StandardInput.WriteLineAsync(
+                    "{\"method\":\"initialized\",\"params\":{}}");
+                await process.StandardInput.WriteLineAsync(
+                    "{\"method\":\"account/rateLimits/read\",\"id\":2}");
+                await process.StandardInput.FlushAsync();
+                break;
+            }
+
+            while (!timeout.IsCancellationRequested && !process.HasExited)
+            {
+                var line = await process.StandardOutput.ReadLineAsync(timeout.Token);
+                if (line is null)
                 {
-                    latest = snapshot;
+                    break;
+                }
+
+                if (HasResponseId(line, 2))
+                {
+                    return TryParseRateLimitsResponse(line);
                 }
             }
         }
-        catch (IOException)
+        catch (Exception exception) when (
+            exception is IOException or InvalidOperationException or
+            System.ComponentModel.Win32Exception or OperationCanceledException or JsonException)
         {
             return null;
         }
-        catch (UnauthorizedAccessException)
+        finally
         {
-            return null;
+            if (!process.HasExited)
+            {
+                try
+                {
+                    process.Kill(entireProcessTree: true);
+                    await process.WaitForExitAsync();
+                }
+                catch (Exception exception) when (
+                    exception is InvalidOperationException or System.ComponentModel.Win32Exception)
+                {
+                    // The short-lived app-server may exit between the checks above.
+                }
+            }
         }
 
-        return latest;
+        return null;
     }
 
-    internal static UsageSnapshot? TryParseSnapshot(string jsonLine, string sourceFile)
+    internal static UsageSnapshot? TryParseRateLimitsResponse(string jsonLine)
     {
-        try
-        {
-            using var document = JsonDocument.Parse(jsonLine);
-            var root = document.RootElement;
-            if (!TryGetString(root, "type", out var eventType) ||
-                eventType != "event_msg" ||
-                !root.TryGetProperty("payload", out var payload) ||
-                !TryGetString(payload, "type", out var payloadType) ||
-                payloadType != "token_count" ||
-                !payload.TryGetProperty("rate_limits", out var rateLimits) ||
-                rateLimits.ValueKind != JsonValueKind.Object)
-            {
-                return null;
-            }
-
-            var limits = new List<LimitSnapshot>(2);
-            TryAddLimit(rateLimits, "primary", "主窗口", limits);
-            TryAddLimit(rateLimits, "secondary", "次窗口", limits);
-            if (limits.Count == 0)
-            {
-                return null;
-            }
-
-            var timestamp = DateTimeOffset.MinValue;
-            if (TryGetString(root, "timestamp", out var timestampText))
-            {
-                _ = DateTimeOffset.TryParse(timestampText, out timestamp);
-            }
-            if (timestamp == DateTimeOffset.MinValue)
-            {
-                timestamp = File.GetLastWriteTimeUtc(sourceFile);
-            }
-
-            var selected = limits
-                .OrderByDescending(limit => limit.UsedPercent)
-                .ThenByDescending(limit => limit.WindowMinutes ?? 0)
-                .First();
-
-            _ = TryGetString(rateLimits, "plan_type", out var planType);
-            _ = TryGetString(rateLimits, "limit_id", out var limitId);
-
-            return new UsageSnapshot(
-                timestamp,
-                sourceFile,
-                planType,
-                limitId,
-                limits,
-                selected);
-        }
-        catch (JsonException)
+        using var document = JsonDocument.Parse(jsonLine);
+        var root = document.RootElement;
+        if (!root.TryGetProperty("result", out var result) ||
+            !result.TryGetProperty("rateLimitsByLimitId", out var buckets) ||
+            buckets.ValueKind != JsonValueKind.Object)
         {
             return null;
         }
-        catch (IOException)
+
+        var snapshots = new List<UsageSnapshot>();
+        foreach (var bucketProperty in buckets.EnumerateObject())
+        {
+            if (bucketProperty.Value.ValueKind != JsonValueKind.Object)
+            {
+                continue;
+            }
+
+            var bucket = bucketProperty.Value;
+            var limitId = GetString(bucket, "limitId") ?? bucketProperty.Name;
+            var limitName = GetString(bucket, "limitName") ??
+                (string.Equals(limitId, "codex", StringComparison.Ordinal) ? "Codex" : limitId);
+            var planType = GetString(bucket, "planType");
+
+            var windows = new List<UsageSnapshot>(2);
+            TryAddWindow(bucket, "primary", limitId, limitName, planType, windows);
+            TryAddWindow(bucket, "secondary", limitId, limitName, planType, windows);
+            if (windows.Count > 0)
+            {
+                snapshots.Add(windows
+                    .OrderByDescending(snapshot => snapshot.UsedPercent)
+                    .First());
+            }
+        }
+
+        if (snapshots.Count == 0)
         {
             return null;
         }
+
+        return snapshots.FirstOrDefault(
+            snapshot => string.Equals(snapshot.LimitId, "codex", StringComparison.Ordinal));
     }
 
-    private static void TryAddLimit(
-        JsonElement rateLimits,
+    private static void TryAddWindow(
+        JsonElement bucket,
         string propertyName,
-        string displayName,
-        ICollection<LimitSnapshot> limits)
+        string limitId,
+        string limitName,
+        string? planType,
+        ICollection<UsageSnapshot> snapshots)
     {
-        if (!rateLimits.TryGetProperty(propertyName, out var limit) ||
-            limit.ValueKind != JsonValueKind.Object ||
-            !limit.TryGetProperty("used_percent", out var usedPercentElement) ||
+        if (!bucket.TryGetProperty(propertyName, out var window) ||
+            window.ValueKind != JsonValueKind.Object ||
+            !window.TryGetProperty("usedPercent", out var usedPercentElement) ||
             !usedPercentElement.TryGetDouble(out var usedPercent))
         {
             return;
         }
 
-        int? windowMinutes = null;
-        if (limit.TryGetProperty("window_minutes", out var windowElement) &&
-            windowElement.TryGetInt32(out var parsedWindowMinutes))
-        {
-            windowMinutes = parsedWindowMinutes;
-        }
-
         DateTimeOffset? resetsAt = null;
-        if (limit.TryGetProperty("resets_at", out var resetElement) &&
-            resetElement.TryGetInt64(out var unixSeconds))
+        if (window.TryGetProperty("resetsAt", out var resetsAtElement) &&
+            resetsAtElement.TryGetInt64(out var unixSeconds))
         {
             try
             {
@@ -275,23 +191,98 @@ public sealed class UsageReader
             }
         }
 
-        limits.Add(new LimitSnapshot(
-            displayName,
+        snapshots.Add(new UsageSnapshot(
+            DateTimeOffset.Now,
+            planType,
+            limitId,
+            limitName,
             Math.Clamp(usedPercent, 0, 100),
-            windowMinutes,
             resetsAt));
     }
 
-    private static bool TryGetString(JsonElement element, string propertyName, out string? value)
+    private static string? GetString(JsonElement element, string propertyName)
     {
-        value = null;
-        if (!element.TryGetProperty(propertyName, out var property) ||
-            property.ValueKind != JsonValueKind.String)
+        return element.TryGetProperty(propertyName, out var property) &&
+            property.ValueKind == JsonValueKind.String
+                ? property.GetString()
+                : null;
+    }
+
+    private static bool HasResponseId(string jsonLine, int expectedId)
+    {
+        try
+        {
+            using var document = JsonDocument.Parse(jsonLine);
+            return document.RootElement.TryGetProperty("id", out var id) &&
+                id.TryGetInt32(out var parsedId) &&
+                parsedId == expectedId;
+        }
+        catch (JsonException)
         {
             return false;
         }
+    }
 
-        value = property.GetString();
-        return value is not null;
+    private static ProcessStartInfo CreateStartInfo(string codexPath)
+    {
+        var startInfo = new ProcessStartInfo
+        {
+            UseShellExecute = false,
+            RedirectStandardInput = true,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            CreateNoWindow = true
+        };
+
+        if (string.Equals(Path.GetExtension(codexPath), ".cmd", StringComparison.OrdinalIgnoreCase))
+        {
+            startInfo.FileName = Environment.GetEnvironmentVariable("ComSpec") ?? "cmd.exe";
+            startInfo.ArgumentList.Add("/d");
+            startInfo.ArgumentList.Add("/s");
+            startInfo.ArgumentList.Add("/c");
+            startInfo.ArgumentList.Add($"\"{codexPath}\" app-server");
+        }
+        else
+        {
+            startInfo.FileName = codexPath;
+            startInfo.ArgumentList.Add("app-server");
+        }
+
+        return startInfo;
+    }
+
+    private static string? FindCodexExecutable()
+    {
+        var localAppData = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
+        var appData = Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData);
+        var knownPaths = new[]
+        {
+            Path.Combine(localAppData, "OpenAI", "Codex", "bin", "codex.exe"),
+            Path.Combine(appData, "npm", "codex.cmd")
+        };
+
+        foreach (var path in knownPaths)
+        {
+            if (File.Exists(path))
+            {
+                return path;
+            }
+        }
+
+        var pathValue = Environment.GetEnvironmentVariable("PATH") ?? string.Empty;
+        foreach (var directory in pathValue.Split(Path.PathSeparator, StringSplitOptions.RemoveEmptyEntries))
+        {
+            var normalizedDirectory = directory.Trim().Trim('"');
+            foreach (var fileName in new[] { "codex.exe", "codex.cmd" })
+            {
+                var candidate = Path.Combine(normalizedDirectory, fileName);
+                if (File.Exists(candidate))
+                {
+                    return candidate;
+                }
+            }
+        }
+
+        return null;
     }
 }

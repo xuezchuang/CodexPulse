@@ -1,8 +1,6 @@
 using System;
-using System.Collections.Generic;
 using System.ComponentModel;
 using System.Globalization;
-using System.Linq;
 using System.Threading.Tasks;
 using System.Windows;
 using System.Windows.Controls;
@@ -21,6 +19,7 @@ public sealed class MainWindow : Window
     private readonly WidgetSettings _settings;
     private readonly DispatcherTimer _usageRefreshTimer;
     private readonly DispatcherTimer _systemRefreshTimer;
+    private readonly TextBlock _titleText;
     private readonly TextBlock _percentText;
     private readonly TextBlock _detailText;
     private readonly Path _progressArc;
@@ -155,17 +154,19 @@ public sealed class MainWindow : Window
         labels.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
 
         var titleLayout = new StackPanel();
-        titleLayout.Children.Add(new TextBlock
+        _titleText = new TextBlock
         {
             Text = "Codex Left",
             Foreground = new SolidColorBrush(Color.FromRgb(239, 242, 245)),
             FontFamily = new FontFamily("Segoe UI Variable Display, Segoe UI"),
             FontSize = 23,
-            FontWeight = FontWeights.SemiBold
-        });
+            FontWeight = FontWeights.SemiBold,
+            TextTrimming = TextTrimming.CharacterEllipsis
+        };
+        titleLayout.Children.Add(_titleText);
         _detailText = new TextBlock
         {
-            Text = "正在读取本地用量…",
+            Text = "正在读取 Codex 额度…",
             Foreground = new SolidColorBrush(Color.FromRgb(151, 158, 166)),
             FontFamily = new FontFamily("Segoe UI Variable Text, Segoe UI"),
             FontSize = 15.5,
@@ -320,7 +321,7 @@ public sealed class MainWindow : Window
 
         _usageRefreshTimer = new DispatcherTimer
         {
-            Interval = TimeSpan.FromSeconds(20)
+            Interval = TimeSpan.FromMinutes(5)
         };
         _usageRefreshTimer.Tick += (_, _) => RefreshNow();
 
@@ -514,9 +515,10 @@ public sealed class MainWindow : Window
 
     private void ShowSnapshot(UsageSnapshot snapshot)
     {
-        var remaining = Math.Clamp(100 - snapshot.SelectedLimit.UsedPercent, 0, 100);
+        var remaining = Math.Clamp(100 - snapshot.UsedPercent, 0, 100);
         _remainingFraction = remaining / 100;
         _percentText.Text = $"{Math.Round(remaining, MidpointRounding.AwayFromZero):0}%";
+        _titleText.Text = "Codex";
 
         var accent = remaining switch
         {
@@ -526,56 +528,13 @@ public sealed class MainWindow : Window
         _progressArc.Stroke = new SolidColorBrush(accent);
         UpdateProgressArc();
 
-        var windowText = FormatWindow(snapshot.SelectedLimit.WindowMinutes);
-        var resetText = FormatReset(snapshot.SelectedLimit.ResetsAt);
-        _detailText.Text = string.Join(" · ", new[] { windowText, resetText }.Where(value => value.Length > 0));
-
-        var localTimestamp = snapshot.SourceTimestamp.ToLocalTime();
-        var limitLines = snapshot.Limits.Select(limit =>
-        {
-            var limitRemaining = Math.Clamp(100 - limit.UsedPercent, 0, 100);
-            var exactReset = limit.ResetsAt is null
-                ? string.Empty
-                : $"，{limit.ResetsAt.Value.ToLocalTime():M/d HH:mm} 重置";
-            return $"{FormatWindow(limit.WindowMinutes)}：剩余 {limitRemaining:0.#}%{exactReset}";
-        });
-        var tooltipLines = new List<string>
-        {
-            $"Codex 剩余 {remaining:0.#}%"
-        };
-        tooltipLines.AddRange(limitLines);
-        tooltipLines.Add($"数据时间：{localTimestamp:yyyy-MM-dd HH:mm:ss}");
-        ToolTip = string.Join(Environment.NewLine, tooltipLines);
+        var resetText = FormatReset(snapshot.ResetsAt);
+        _detailText.Text = resetText;
+        ToolTip = $"Codex 剩余 {remaining:0.#}%{Environment.NewLine}{resetText}";
 
         SnapshotChanged?.Invoke(
             remaining,
             $"Codex 剩余 {Math.Round(remaining, MidpointRounding.AwayFromZero):0}%");
-    }
-
-    private static string FormatWindow(int? windowMinutes)
-    {
-        if (windowMinutes is null)
-        {
-            return "限额窗口";
-        }
-
-        if (windowMinutes.Value % (7 * 24 * 60) == 0)
-        {
-            var weeks = windowMinutes.Value / (7 * 24 * 60);
-            return weeks == 1 ? "7天窗口" : $"{weeks}周窗口";
-        }
-
-        if (windowMinutes.Value % (24 * 60) == 0)
-        {
-            return $"{windowMinutes.Value / (24 * 60)}天窗口";
-        }
-
-        if (windowMinutes.Value % 60 == 0)
-        {
-            return $"{windowMinutes.Value / 60}小时窗口";
-        }
-
-        return $"{windowMinutes.Value}分钟窗口";
     }
 
     private static string FormatReset(DateTimeOffset? resetsAt)
@@ -586,23 +545,12 @@ public sealed class MainWindow : Window
         }
 
         var localReset = resetsAt.Value.ToLocalTime();
-        var remaining = localReset - DateTimeOffset.Now;
-        if (remaining <= TimeSpan.Zero)
+        if (localReset <= DateTimeOffset.Now)
         {
-            return "等待限额刷新";
+            return "等待额度刷新";
         }
 
-        if (remaining < TimeSpan.FromHours(24))
-        {
-            if (remaining < TimeSpan.FromHours(1))
-            {
-                return $"{Math.Max(1, (int)Math.Ceiling(remaining.TotalMinutes))}分钟后重置";
-            }
-
-            return $"{Math.Max(1, (int)Math.Ceiling(remaining.TotalHours))}小时后重置";
-        }
-
-        return localReset.ToString("M/d重置", CultureInfo.GetCultureInfo("zh-CN"));
+        return localReset.ToString("M/d HH:mm 重置", CultureInfo.GetCultureInfo("zh-CN"));
     }
 
     private void UpdateProgressArc()

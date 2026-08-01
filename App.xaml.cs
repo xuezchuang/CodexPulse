@@ -1,8 +1,6 @@
 using System;
-using System.Diagnostics;
 using System.Drawing;
 using System.Drawing.Drawing2D;
-using System.IO;
 using System.Runtime.InteropServices;
 using System.Threading;
 using System.Windows;
@@ -41,11 +39,11 @@ public partial class App : System.Windows.Application
         _window.StartupToggleRequested += ToggleStartup;
         _window.ExitRequested += ExitApplication;
 
-        CreateNotifyIcon(reader.SessionRoot);
+        CreateNotifyIcon();
         _window.Show();
     }
 
-    private void CreateNotifyIcon(string sessionRoot)
+    private void CreateNotifyIcon()
     {
         _notifyIconImage = CreateUsageIcon(null, Color.FromArgb(83, 92, 104));
         _notifyIcon = new Forms.NotifyIcon
@@ -78,22 +76,6 @@ public partial class App : System.Windows.Application
         };
         _startupMenuItem.Click += (_, _) => Dispatcher.Invoke(ToggleStartup);
         menu.Items.Add(_startupMenuItem);
-
-        var openDataItem = new Forms.ToolStripMenuItem("打开 Codex 数据目录");
-        openDataItem.Click += (_, _) =>
-        {
-            if (!Directory.Exists(sessionRoot))
-            {
-                return;
-            }
-
-            Process.Start(new ProcessStartInfo
-            {
-                FileName = sessionRoot,
-                UseShellExecute = true
-            });
-        };
-        menu.Items.Add(openDataItem);
 
         menu.Items.Add(new Forms.ToolStripSeparator());
         var exitItem = new Forms.ToolStripMenuItem("退出");
