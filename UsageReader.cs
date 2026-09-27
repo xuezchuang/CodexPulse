@@ -20,75 +20,56 @@ public sealed record UsageSnapshot(
 public sealed class UsageReader
 {
     private static readonly TimeSpan RequestTimeout = TimeSpan.FromSeconds(20);
+    private static readonly TimeSpan ShutdownTimeout = TimeSpan.FromSeconds(5);
 
     public UsageSnapshot? ReadLatest()
     {
-        return ReadLatestAsync().GetAwaiter().GetResult();
+        var codexPath = FindCodexExecutable();
+        return codexPath is null
+            ? null
+            : ReadLatestAsync(CreateStartInfo(codexPath)).GetAwaiter().GetResult();
     }
 
-    private static async Task<UsageSnapshot?> ReadLatestAsync()
+    internal static async Task<UsageSnapshot?> ReadLatestAsync(
+        ProcessStartInfo startInfo,
+        TimeSpan? requestTimeout = null,
+        TimeSpan? shutdownTimeout = null)
     {
-        var codexPath = FindCodexExecutable();
-        if (codexPath is null)
-        {
-            return null;
-        }
-
-        using var process = new Process
-        {
-            StartInfo = CreateStartInfo(codexPath),
-            EnableRaisingEvents = true
-        };
+        using var process = new Process { StartInfo = startInfo };
+        using var outputCancellation = new CancellationTokenSource();
+        var started = false;
+        Task errorDrain = Task.CompletedTask;
 
         try
         {
-            if (!process.Start())
+            started = process.Start();
+            if (!started)
             {
                 return null;
             }
 
-            process.ErrorDataReceived += static (_, _) => { };
-            process.BeginErrorReadLine();
+            // Drain stderr without retaining logs or blocking the child on a full pipe.
+            errorDrain = DrainAsync(process.StandardError, outputCancellation.Token);
+            using var timeout = new CancellationTokenSource(requestTimeout ?? RequestTimeout);
+            await process.StandardInput.WriteLineAsync(
+                "{\"method\":\"initialize\",\"id\":1,\"params\":{\"clientInfo\":{\"name\":\"codex_pulse\",\"title\":\"CodexPulse\",\"version\":\"1.0.0\"}}}".AsMemory(),
+                timeout.Token);
+            await process.StandardInput.FlushAsync(timeout.Token);
+
+            var initialization = await ReadResponseAsync(process.StandardOutput, 1, timeout.Token);
+            if (initialization is null || !HasSuccessfulResult(initialization))
+            {
+                return null;
+            }
 
             await process.StandardInput.WriteLineAsync(
-                "{\"method\":\"initialize\",\"id\":1,\"params\":{\"clientInfo\":{\"name\":\"codex_pulse\",\"title\":\"CodexPulse\",\"version\":\"1.0.0\"}}}");
-            await process.StandardInput.FlushAsync();
+                "{\"method\":\"initialized\",\"params\":{}}".AsMemory(), timeout.Token);
+            await process.StandardInput.WriteLineAsync(
+                "{\"method\":\"account/rateLimits/read\",\"id\":2}".AsMemory(), timeout.Token);
+            await process.StandardInput.FlushAsync(timeout.Token);
 
-            using var timeout = new CancellationTokenSource(RequestTimeout);
-            while (!timeout.IsCancellationRequested && !process.HasExited)
-            {
-                var line = await process.StandardOutput.ReadLineAsync(timeout.Token);
-                if (line is null)
-                {
-                    break;
-                }
-
-                if (!HasResponseId(line, 1))
-                {
-                    continue;
-                }
-
-                await process.StandardInput.WriteLineAsync(
-                    "{\"method\":\"initialized\",\"params\":{}}");
-                await process.StandardInput.WriteLineAsync(
-                    "{\"method\":\"account/rateLimits/read\",\"id\":2}");
-                await process.StandardInput.FlushAsync();
-                break;
-            }
-
-            while (!timeout.IsCancellationRequested && !process.HasExited)
-            {
-                var line = await process.StandardOutput.ReadLineAsync(timeout.Token);
-                if (line is null)
-                {
-                    break;
-                }
-
-                if (HasResponseId(line, 2))
-                {
-                    return TryParseRateLimitsResponse(line);
-                }
-            }
+            var response = await ReadResponseAsync(process.StandardOutput, 2, timeout.Token);
+            return response is null ? null : TryParseRateLimitsResponse(response);
         }
         catch (Exception exception) when (
             exception is IOException or InvalidOperationException or
@@ -98,22 +79,100 @@ public sealed class UsageReader
         }
         finally
         {
-            if (!process.HasExited)
+            // A failed Start has no process handle; even HasExited would throw in that case.
+            if (started)
             {
+                var outputDrain = DrainAsync(process.StandardOutput, outputCancellation.Token);
                 try
                 {
-                    process.Kill(entireProcessTree: true);
-                    await process.WaitForExitAsync();
+                    await StopProcessAsync(process, shutdownTimeout ?? ShutdownTimeout);
                 }
-                catch (Exception exception) when (
-                    exception is InvalidOperationException or System.ComponentModel.Win32Exception)
+                finally
                 {
-                    // The short-lived app-server may exit between the checks above.
+                    outputCancellation.Cancel();
+                    await Task.WhenAll(outputDrain, errorDrain);
                 }
+            }
+        }
+    }
+
+    private static async Task<string?> ReadResponseAsync(
+        StreamReader output, int expectedId, CancellationToken cancellationToken)
+    {
+        while (await output.ReadLineAsync(cancellationToken) is { } line)
+        {
+            if (HasResponseId(line, expectedId))
+            {
+                return line;
             }
         }
 
         return null;
+    }
+
+    private static bool HasSuccessfulResult(string jsonLine)
+    {
+        using var document = JsonDocument.Parse(jsonLine);
+        return document.RootElement.TryGetProperty("result", out var result) &&
+            result.ValueKind == JsonValueKind.Object &&
+            !document.RootElement.TryGetProperty("error", out _);
+    }
+
+    private static async Task DrainAsync(StreamReader reader, CancellationToken cancellationToken)
+    {
+        try
+        {
+            var buffer = new char[4096];
+            while (await reader.ReadAsync(buffer.AsMemory(), cancellationToken) != 0)
+            {
+            }
+        }
+        catch (Exception exception) when (
+            exception is IOException or OperationCanceledException or InvalidOperationException)
+        {
+            // Pipes may close while the owned process is exiting.
+        }
+    }
+
+    private static async Task StopProcessAsync(Process process, TimeSpan shutdownTimeout)
+    {
+        try
+        {
+            // EOF closes the stdio connection and lets app-server shut itself down.
+            process.StandardInput.Close();
+        }
+        catch (Exception exception) when (exception is IOException or InvalidOperationException)
+        {
+            // A crashed server may already have closed its input pipe.
+        }
+
+        try
+        {
+            using var gracePeriod = new CancellationTokenSource(shutdownTimeout);
+            try
+            {
+                await process.WaitForExitAsync(gracePeriod.Token);
+                return;
+            }
+            catch (OperationCanceledException)
+            {
+                // Fall back only when this query's server does not honor EOF.
+            }
+
+            if (!process.HasExited)
+            {
+                process.Kill();
+            }
+
+            using var killTimeout = new CancellationTokenSource(shutdownTimeout);
+            await process.WaitForExitAsync(killTimeout.Token);
+        }
+        catch (Exception exception) when (
+            exception is InvalidOperationException or System.ComponentModel.Win32Exception or
+            OperationCanceledException)
+        {
+            // Exit races must not turn a completed usage query into a widget failure.
+        }
     }
 
     internal static UsageSnapshot? TryParseRateLimitsResponse(string jsonLine)
@@ -213,7 +272,9 @@ public sealed class UsageReader
         try
         {
             using var document = JsonDocument.Parse(jsonLine);
-            return document.RootElement.TryGetProperty("id", out var id) &&
+            return document.RootElement.ValueKind == JsonValueKind.Object &&
+                document.RootElement.TryGetProperty("id", out var id) &&
+                id.ValueKind == JsonValueKind.Number &&
                 id.TryGetInt32(out var parsedId) &&
                 parsedId == expectedId;
         }
@@ -223,10 +284,13 @@ public sealed class UsageReader
         }
     }
 
-    private static ProcessStartInfo CreateStartInfo(string codexPath)
+    internal static ProcessStartInfo CreateStartInfo(string codexPath)
     {
         var startInfo = new ProcessStartInfo
         {
+            FileName = codexPath,
+            // Do not inherit a repository as the app-server's working directory.
+            WorkingDirectory = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
             UseShellExecute = false,
             RedirectStandardInput = true,
             RedirectStandardOutput = true,
@@ -234,18 +298,12 @@ public sealed class UsageReader
             CreateNoWindow = true
         };
 
-        if (string.Equals(Path.GetExtension(codexPath), ".cmd", StringComparison.OrdinalIgnoreCase))
+        startInfo.ArgumentList.Add("app-server");
+        foreach (var feature in new[] { "plugins", "apps", "code_mode_host" })
         {
-            startInfo.FileName = Environment.GetEnvironmentVariable("ComSpec") ?? "cmd.exe";
-            startInfo.ArgumentList.Add("/d");
-            startInfo.ArgumentList.Add("/s");
-            startInfo.ArgumentList.Add("/c");
-            startInfo.ArgumentList.Add($"\"{codexPath}\" app-server");
-        }
-        else
-        {
-            startInfo.FileName = codexPath;
-            startInfo.ArgumentList.Add("app-server");
+            // Per-process overrides: quota reads need no plugin Git sync, apps, or code host.
+            startInfo.ArgumentList.Add("-c");
+            startInfo.ArgumentList.Add($"features.{feature}=false");
         }
 
         return startInfo;
@@ -253,29 +311,65 @@ public sealed class UsageReader
 
     private static string? FindCodexExecutable()
     {
-        var localAppData = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
-        var appData = Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData);
-        var knownPaths = new[]
-        {
-            Path.Combine(localAppData, "OpenAI", "Codex", "bin", "codex.exe"),
-            Path.Combine(appData, "npm", "codex.cmd")
-        };
+        return FindCodexExecutable(
+            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+            Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
+            Environment.GetEnvironmentVariable("PATH") ?? string.Empty);
+    }
 
-        foreach (var path in knownPaths)
+    internal static string? FindCodexExecutable(string localAppData, string appData, string pathValue)
+    {
+        var desktopBin = Path.Combine(localAppData, "OpenAI", "Codex", "bin");
+        try
         {
-            if (File.Exists(path))
+            // Desktop updates live in versioned subdirectories. The root exe may be months old.
+            if (Directory.Exists(desktopBin))
             {
-                return path;
+                var currentDesktop = Directory.EnumerateDirectories(desktopBin)
+                    .Select(directory => new FileInfo(Path.Combine(directory, "codex.exe")))
+                    .Where(file => file.Exists)
+                    .OrderByDescending(file => file.LastWriteTimeUtc)
+                    .ThenBy(file => file.FullName, StringComparer.OrdinalIgnoreCase)
+                    .FirstOrDefault();
+                if (currentDesktop is not null)
+                {
+                    return currentDesktop.FullName;
+                }
+            }
+        }
+        catch (Exception exception) when (exception is IOException or UnauthorizedAccessException)
+        {
+            // Continue with a native CLI installation if the desktop directory is unavailable.
+        }
+
+        foreach (var directory in pathValue.Split(Path.PathSeparator, StringSplitOptions.RemoveEmptyEntries))
+        {
+            var candidate = Path.Combine(directory.Trim().Trim('"'), "codex.exe");
+            if (File.Exists(candidate))
+            {
+                return candidate;
             }
         }
 
-        var pathValue = Environment.GetEnvironmentVariable("PATH") ?? string.Empty;
-        foreach (var directory in pathValue.Split(Path.PathSeparator, StringSplitOptions.RemoveEmptyEntries))
+        // Resolve npm's native binary directly, avoiding a cmd/node wrapper and extra process tree.
+        var npmPackage = Path.Combine(appData, "npm", "node_modules", "@openai", "codex");
+        var target = Environment.Is64BitOperatingSystem &&
+            System.Runtime.InteropServices.RuntimeInformation.OSArchitecture ==
+                System.Runtime.InteropServices.Architecture.Arm64
+            ? "aarch64-pc-windows-msvc"
+            : "x86_64-pc-windows-msvc";
+        var platformPackage = target.StartsWith("aarch64", StringComparison.Ordinal)
+            ? "codex-win32-arm64"
+            : "codex-win32-x64";
+        foreach (var vendor in new[]
         {
-            var normalizedDirectory = directory.Trim().Trim('"');
-            foreach (var fileName in new[] { "codex.exe", "codex.cmd" })
+            Path.Combine(npmPackage, "node_modules", "@openai", platformPackage, "vendor"),
+            Path.Combine(npmPackage, "vendor")
+        })
+        {
+            foreach (var nativeDirectory in new[] { "bin", "codex" })
             {
-                var candidate = Path.Combine(normalizedDirectory, fileName);
+                var candidate = Path.Combine(vendor, target, nativeDirectory, "codex.exe");
                 if (File.Exists(candidate))
                 {
                     return candidate;
@@ -283,6 +377,7 @@ public sealed class UsageReader
             }
         }
 
-        return null;
+        var legacyDesktop = Path.Combine(desktopBin, "codex.exe");
+        return File.Exists(legacyDesktop) ? legacyDesktop : null;
     }
 }
